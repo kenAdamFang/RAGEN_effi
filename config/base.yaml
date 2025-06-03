@@ -83,6 +83,11 @@ algorithm:
     type: fixed
     kl_coef: 0.000
 
+replay_buffer:
+  enable: true
+  capacity: 10000
+  sampling_batch_size: 128
+
 trainer:
   project_name: ragen_latest
   experiment_name: test
