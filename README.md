@@ -365,3 +365,164 @@ If you find RAGEN useful, we would appreciate it if you consider citing our work
       url={https://arxiv.org/abs/2504.20073}, 
 }
 ```
+
+Markdown Document: RAGEN Replay Buffer Implementation Explained
+
+# RAGEN Framework: Replay Buffer Implementation Details
+
+This document explains the implementation of the replay buffer functionality within the RAGEN framework, focusing on how experiences are collected, stored, sampled, and used for training the PPO agent. The primary file for these changes is `ragen/trainer/agent_trainer.py`.
+
+## 1. Core Idea
+
+The goal is to allow the PPO agent to train on experiences sampled from a buffer, rather than solely on the most recently generated (on-policy) trajectory. This involves:
+    1.  Generating on-policy trajectories.
+    2.  Storing these trajectories in a replay buffer.
+    3.  When a PPO update is due, sampling a batch of trajectories from this buffer.
+    4.  Using this sampled batch for calculating advantages and performing actor/critic updates.
+    5.  Ensuring that all PPO-specific calculations (log_probs, values, advantages) on the sampled batch are performed using the *current* state of the actor and critic models.
+
+## 2. Configuration (`config/base.yaml`)
+
+The replay buffer's behavior is controlled by parameters in `config/base.yaml` under the `replay_buffer` section:
+
+```yaml
+replay_buffer:
+  enable: true               # bool:   Enable (true) or disable (false) the replay buffer.
+  capacity: 10000            # int:    Maximum number of trajectories (DataProto objects) the buffer can hold.
+  sampling_batch_size: 128   # int:    Number of trajectories to sample from the buffer for one PPO training iteration.
+                               #         If 0, on-policy data is used even if the buffer is enabled.
+3. ReplayBuffer Class (ragen/trainer/replay_buffer.py)
+This class is responsible for storing and providing samples of trajectories.
+
+__init__(self, capacity: int, sampling_batch_size: int = None):
+Initializes a collections.deque with maxlen=capacity. This deque stores DataProto objects (each representing a trajectory or a segment of experience).
+The sampling_batch_size argument is optional here and not used internally by the buffer itself for its core logic, as the actual batch size for sampling is passed to the sample method.
+add(self, experience: DataProto):
+Appends a new experience (a DataProto object) to the internal deque. If the deque is full (i.e., at capacity), the oldest experience is automatically discarded (FIFO behavior).
+sample(self, current_batch_size: int = None) -> list[DataProto]:
+Requires current_batch_size to be provided (raises ValueError if None).
+Randomly samples min(current_batch_size, len(self._buffer)) experiences from the deque.
+Returns a list of DataProto objects.
+__len__(self): Returns the current number of experiences in the buffer.
+4. Integration into RayAgentTrainer (ragen/trainer/agent_trainer.py)
+This is where the main logic for using the replay buffer resides, primarily within the __init__ and fit methods.
+
+4.1. Initialization (RayAgentTrainer.__init__)
+Based on self.config.replay_buffer.enable and self.config.replay_buffer.capacity, an instance of ReplayBuffer is created and assigned to self.replay_buffer.
+# In RayAgentTrainer.__init__
+if self.config.get('replay_buffer') and self.config.replay_buffer.enable:
+    self.replay_buffer = ReplayBuffer(capacity=self.config.replay_buffer.capacity)
+    print(f"Replay buffer enabled: capacity={self.config.replay_buffer.capacity}, sampling_batch_size={self.config.replay_buffer.sampling_batch_size}")
+else:
+    self.replay_buffer = None; print("Replay buffer disabled.")
+4.2. Training Loop (RayAgentTrainer.fit)
+This is the core of the interaction. Here's a step-by-step breakdown of the relevant logic within the while self.global_steps <= self.total_training_steps: loop:
+
+Step 1: On-Policy Experience Generation
+
+A new on-policy trajectory (or set of trajectories from parallel environments) is generated.
+# In RayAgentTrainer.fit()
+rollout_meta_info_dict = {"eos_token_id": self.tokenizer.eos_token_id, ... , "validate": False}
+current_rollout_dp = DataProto(meta_info=deepcopy(rollout_meta_info_dict))
+
+with _timer("gen", timing_raw):
+    on_policy_dp = self.agent_proxy.rollout(current_rollout_dp, val=False)
+    # This on_policy_dp is a DataProto object containing the newly generated experience.
+This on_policy_dp is then filtered using _filter_rollout. The refactored _filter_rollout now returns a new DataProto object containing the filtered data.
+# In RayAgentTrainer.fit()
+on_policy_dp, filter_metrics_info = _filter_rollout(on_policy_dp, self.config)
+metrics.update(filter_metrics_info)
+# Log metrics for this on-policy generation
+if hasattr(on_policy_dp,'meta_info') and on_policy_dp.meta_info and "metrics" in on_policy_dp.meta_info:
+    metrics.update({"train/on_policy/" + k: v for k, v in on_policy_dp.meta_info["metrics"].items()})
+Step 2: Adding to Replay Buffer
+
+If the replay buffer is enabled, a deepcopy of the (potentially filtered) on_policy_dp is added to the buffer.
+# In RayAgentTrainer.fit()
+if self.replay_buffer: # Check if replay_buffer object exists
+    self.replay_buffer.add(deepcopy(on_policy_dp))
+Step 3: Batch Selection for PPO Update
+
+This is where the decision is made whether to use data from the replay buffer or the just-generated on-policy data.
+First, numerical metrics for logging the source are initialized:
+# In RayAgentTrainer.fit()
+metrics["train/source_is_replay"] = 0.0
+metrics["train/source_is_on_policy_empty_sample_fallback"] = 0.0
+metrics["train/source_is_on_policy_buffer_disabled"] = 0.0
+metrics["train/source_is_on_policy_sampling_disabled"] = 0.0
+metrics["train/source_is_on_policy_buffer_not_ready"] = 0.0
+The selection logic:
+# In RayAgentTrainer.fit()
+# batch_source_info was removed, direct metric setting is used.
+if self.replay_buffer and        len(self.replay_buffer) >= self.config.replay_buffer.sampling_batch_size and        self.config.replay_buffer.sampling_batch_size > 0:
+
+    sampled_experiences_list = self.replay_buffer.sample(self.config.replay_buffer.sampling_batch_size)
+
+    if sampled_experiences_list:
+        batch = deepcopy(sampled_experiences_list[0]) if self.config.replay_buffer.sampling_batch_size == 1 else self._combine_data_protos(sampled_experiences_list)
+        metrics["train/source_is_replay"] = 1.0
+
+        if not hasattr(batch,'meta_info') or batch.meta_info is None: batch.meta_info = {}
+        current_training_meta_info_dict = deepcopy(rollout_meta_info_dict)
+        current_training_meta_info_dict.update(batch.meta_info)
+        batch.meta_info = current_training_meta_info_dict
+    else:
+        batch = deepcopy(on_policy_dp)
+        metrics["train/source_is_on_policy_empty_sample_fallback"] = 1.0
+else:
+    batch = deepcopy(on_policy_dp)
+    if not self.replay_buffer:
+        metrics["train/source_is_on_policy_buffer_disabled"] = 1.0
+    elif self.config.replay_buffer.sampling_batch_size <= 0:
+        metrics["train/source_is_on_policy_sampling_disabled"] = 1.0
+    else:
+        metrics["train/source_is_on_policy_buffer_not_ready"] = 1.0
+        if self.replay_buffer is not None : metrics["train/replay_buffer_size"] = float(len(self.replay_buffer))
+The batch variable now holds the DataProto object for this PPO training iteration.
+Step 4: _combine_data_protos and _filter_rollout - TensorDict Handling
+
+Both _filter_rollout (when filtering is applied) and _combine_data_protos (when combining multiple DataProtos) are now responsible for ensuring that the batch attribute of the DataProto objects they create is a proper TensorDict instance (or None).
+They achieve this by:
+Collecting filtered/combined tensors into a standard Python dictionary (filtered_batch_data or combined_batch).
+Determining the common batch size of these tensors.
+Creating a TensorDict from this dictionary and common batch size: final_td_batch = TensorDict(source=python_dict_of_tensors, batch_size=common_batch_size)
+Passing this final_td_batch as the batch argument to the DataProto constructor.
+# Example from _filter_rollout (similar logic in _combine_data_protos)
+# ... after filtered_batch_data (python dict) is populated ...
+final_td_batch = None
+if filtered_batch_data:
+    tensor_source_dict = {k: v for k, v in filtered_batch_data.items() if isinstance(v, torch.Tensor)}
+    if tensor_source_dict:
+        common_batch_size = next(iter(tensor_source_dict.values())).shape[:1]
+        try:
+            final_td_batch = TensorDict(source=tensor_source_dict, batch_size=common_batch_size)
+        except Exception as e:
+            print(f"Error creating TensorDict in _filter_rollout: {e}")
+            final_td_batch = None
+# ...
+return DataProto(batch=final_td_batch, non_tensor_batch=filtered_non_tensor_data, meta_info=copied_meta_info), metrics
+This was the fix for the AttributeError: 'dict' object has no attribute 'batch_size'.
+Step 5: PPO Pipeline Processing
+
+The batch (now correctly sourced, combined if necessary, and with its .batch attribute being a proper TensorDict or None) proceeds through the standard PPO calculations as detailed in previous explanations: UID generation, masking, balancing, reward computation, re-computation of log_probs and values using current models, advantage calculation, and finally actor/critic updates.
+5. Verification Points for You
+RayAgentTrainer.__init__:
+Confirm self.replay_buffer initialization and the console printout.
+RayAgentTrainer.fit() - Data Generation & Buffering:
+Trace on_policy_dp after _filter_rollout().
+Confirm self.replay_buffer.add() is called.
+RayAgentTrainer.fit() - Batch Sampling:
+Use breakpoints or print statements to observe:
+len(self.replay_buffer).
+The number of sampled_experiences_list.
+The structure of batch after potential combination by _combine_data_protos. Specifically, check type(batch.batch). It should be <class 'tensordict.tensordict.TensorDict'> or None.
+Monitor logged metrics:
+metrics["train/replay_buffer_size"].
+The metrics["train/source_is_*"] set should have one value as 1.0 and others as 0.0, correctly indicating the data source.
+_filter_rollout() and _combine_data_protos() Correctness:
+The absence of the AttributeError: 'dict' object has no attribute 'batch_size' when DataProto(...) is called within these functions is the primary indicator that they are now correctly producing TensorDict objects for the batch attribute.
+PPO Pipeline:
+Confirm the batch variable is passed through all subsequent PPO processing stages.
+By observing the logged metrics for train/source_is_* and train/replay_buffer_size, you can directly verify if and when the replay buffer is being used and how it's filling up. Small, targeted experiments with specific capacity and sampling_batch_size values can help make this behavior clear.
+
+This detailed walkthrough should help you trace the logic in the code.
