@@ -391,6 +391,7 @@ replay_buffer:
   capacity: 10000            # int:    Maximum number of trajectories (DataProto objects) the buffer can hold.
   sampling_batch_size: 128   # int:    Number of trajectories to sample from the buffer for one PPO training iteration.
                                #         If 0, on-policy data is used even if the buffer is enabled.
+```
 3. ReplayBuffer Class (ragen/trainer/replay_buffer.py)
 This class is responsible for storing and providing samples of trajectories.
 
